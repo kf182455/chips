@@ -1,52 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-台指期籌碼快訊 v3
-重點：小台/微台散戶多空比、三大法人(含外資)買賣超與部位變化
+台指期籌碼快訊
+期貨 / 選擇權 / P-C Ratio / 十大交易人 / 現貨 / 散戶多空比
+資料來源：TAIFEX、TWSE
 
-資料來源：臺灣期貨交易所(TAIFEX)、臺灣證券交易所(TWSE) 公開資料
-
-用法:
-    python chips.py --html
-    python chips.py -d 2026/09/04 --html
-    python chips.py --watch --html     # 等 15:00 自動輪詢
-安裝:
-    pip install requests pandas lxml beautifulsoup4
+用法: python chips.py            (最近交易日)
+      python chips.py -d 2026/09/04
 """
-
-import argparse
-import datetime as dt
-import io
-import json
-import os
-import re
-import sys
-import time
-import zipfile
-
-import pandas as pd
-import requests
+import argparse, datetime as dt, io, json, os, re, time
+import pandas as pd, requests
 
 BASE = "https://www.taifex.com.tw"
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": UA, "Referer": BASE + "/cht/3/futContractsDate",
-                        "Origin": BASE})
-OUTDIR = os.path.dirname(os.path.abspath(__file__))
-
-# 三大法人表的商品名稱 -> 代碼
-PRODUCTS = {"TX": "臺股期貨", "MTX": "小型臺指期貨", "TMF": "微型臺指期貨",
-            "TE": "電子期貨", "TF": "金融期貨"}
+S = requests.Session()
+S.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+                  "Referer": BASE + "/cht/3/futContractsDate", "Origin": BASE})
+OUT = os.path.dirname(os.path.abspath(__file__))
+PROD = {"TX": "臺股期貨", "MTX": "小型臺指期貨", "TMF": "微型臺指期貨",
+        "TE": "電子期貨", "TF": "金融期貨"}
+WHO = ("外資", "投信", "自營商")
 
 
-# ------------------------------------------------------------------ 工具
-def _post_html(path, data, retry=3):
-    url = BASE + path
+# ---------------------------------------------------------------- 工具
+def post(path, data, retry=3):
     last = None
     for i in range(retry):
         try:
-            r = SESSION.post(url, data=data, timeout=25)
+            r = S.post(BASE + path, data=data, timeout=30)
             r.encoding = "utf-8"
             if r.status_code == 200 and len(r.text) > 500:
                 return r.text
@@ -54,70 +35,12 @@ def _post_html(path, data, retry=3):
         except Exception as e:
             last = repr(e)
         time.sleep(2 + i * 2)
-    raise RuntimeError(f"抓取失敗 {url}: {last}")
+    raise RuntimeError(f"{path}: {last}")
 
 
-def _tables(html, min_rows=1):
-    out = []
-    for df in pd.read_html(io.StringIO(html)):
-        if len(df) < min_rows:
-            continue
-        df = df.copy()
-        df.columns = range(df.shape[1])
-        for c in (0, 1, 2):
-            if c in df.columns:
-                df[c] = df[c].ffill()
-        out.append(df)
-    return out
-
-
-def _num(x):
-    if x is None or (isinstance(x, float) and pd.isna(x)):
-        return None
-    s = str(x).replace(",", "").replace("　", "").strip()
-    if s in ("-", "", "nan"):
-        return None
-    s = s.replace("(", "-").replace(")", "")
-    m = re.search(r"-?\d+\.?\d*", s)
-    return int(float(m.group())) if m else None
-
-
-def _find_row(df, *kw):
-    for _, row in df.iterrows():
-        j = " ".join(str(v) for v in row.tolist())
-        if all(k in j for k in kw):
-            return row
-    return None
-
-
-def _dump(df, name, date_str):
-    if df is None:
-        return
-    try:
-        df.to_csv(os.path.join(OUTDIR, f"raw_{name}_{date_str.replace('/', '')}.csv"),
-                  index=False, encoding="utf-8-sig")
-    except Exception:
-        pass
-
-
-def last_trading_day(today=None):
-    d = today or dt.date.today()
-    while d.weekday() >= 5:
-        d -= dt.timedelta(days=1)
-    return d
-
-
-def prev_trading_day(s):
-    d = dt.datetime.strptime(s, "%Y/%m/%d").date() - dt.timedelta(days=1)
-    while d.weekday() >= 5:
-        d -= dt.timedelta(days=1)
-    return d.strftime("%Y/%m/%d")
-
-
-
-def _read_named(html):
-    """讀表格並把多層表頭攤平成可辨識的欄位名稱（避免依賴欄位位置）。"""
-    out = []
+def tables(html):
+    """讀表格，多層表頭攤平成名稱（不依賴欄位位置）"""
+    res = []
     for df in pd.read_html(io.StringIO(html)):
         cols = []
         for c in df.columns:
@@ -125,472 +48,306 @@ def _read_named(html):
                 seen = []
                 for x in c:
                     x = str(x).strip()
-                    if x.startswith("Unnamed") or x in seen:
-                        continue
-                    seen.append(x)
+                    if not x.startswith("Unnamed") and x not in seen:
+                        seen.append(x)
                 cols.append(" ".join(seen))
             else:
                 cols.append(str(c).strip())
         d = df.copy()
         d.columns = cols
-        out.append(d)
-    return out
+        res.append(d)
+    return res
 
 
-def _col(df, *kw):
+def col(df, *kw):
     for c in df.columns:
         if all(k in str(c) for k in kw):
             return c
     return None
 
 
-# ------------------------------------------------- 三大法人 期貨
-def fetch_inst_futures(date_str):
-    html = _post_html("/cht/3/futContractsDate", {
-        "queryType": "2", "goDay": "", "doQuery": "1",
-        "dateaddcnt": "", "queryDate": date_str, "commodityId": "",
-    })
-    tbs = _tables(html, min_rows=5)
-    if not tbs:
-        raise RuntimeError("三大法人期貨：查無資料（尚未公布或非交易日）")
-    df = max(tbs, key=len)
-
-    def grab(prod, who):
-        row = _find_row(df, prod, who)
-        if row is None:
-            return None
-        return {"買賣超口數": _num(row.get(7)),
-                "多方未平倉": _num(row.get(9)),
-                "空方未平倉": _num(row.get(11)),
-                "淨未平倉": _num(row.get(13))}
-
-    return ({k: {w: grab(v, w) for w in ("自營商", "投信", "外資")}
-             for k, v in PRODUCTS.items()}, df)
+def num(x):
+    s = str(x).replace(",", "").strip()
+    if s in ("-", "", "nan", "None"):
+        return None
+    m = re.search(r"-?\d+\.?\d*", s.replace("(", "-").replace(")", ""))
+    return int(float(m.group())) if m else None
 
 
-# ------------------------------------------------- 三大法人 選擇權
-def fetch_inst_options(date_str):
-    html = _post_html("/cht/3/callsAndPutsDate", {
-        "queryType": "2", "goDay": "", "doQuery": "1",
-        "dateaddcnt": "", "queryDate": date_str, "commodityId": "TXO",
-    })
-    tbs = _tables(html, min_rows=5)
-    if not tbs:
-        raise RuntimeError("三大法人選擇權：查無資料")
-    df = max(tbs, key=len)
-
-    def grab(cp, who):
-        row = _find_row(df, cp, who)
-        if row is None:
-            return None
-        return {"買賣超口數": _num(row.get(8)), "淨未平倉": _num(row.get(14))}
-
-    return ({"CALL": {w: grab("買權", w) for w in ("自營商", "投信", "外資")},
-             "PUT": {w: grab("賣權", w) for w in ("自營商", "投信", "外資")}}, df)
+def rowfind(df, *kw):
+    for _, r in df.iterrows():
+        if all(k in " ".join(str(v) for v in r.tolist()) for k in kw):
+            return r
+    return None
 
 
-# ------------------------------------------------- 全市場未平倉量
-def fetch_total_oi(date_str, commodity):
-    """
-    取得該商品全市場未沖銷契約量(OI)。
-    一律用「欄位名稱」定位，不依賴欄位位置
-    （期交所 2025/12/08 起一般交易時段行情表新增「契約到期日」欄，位置會位移）。
-    """
-    # 策略 A：大額交易人表的「全市場未沖銷部位數」— 定義上就是全市場 OI
-    try:
-        html = _post_html("/cht/3/largeTraderFutQry", {
-            "queryType": "1", "goDay": "", "doQuery": "1", "dateaddcnt": "",
-            "queryDate": date_str, "commodityId": commodity,
-            "contractId": commodity,
-        }, retry=2)
-        for df in _read_named(html):
-            c_oi = _col(df, "全市場未沖銷")
-            c_m = _col(df, "到期月份") or _col(df, "契約")
-            if not c_oi:
+def prev_day(s):
+    d = dt.datetime.strptime(s, "%Y/%m/%d").date() - dt.timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= dt.timedelta(days=1)
+    return d.strftime("%Y/%m/%d")
+
+
+# ---------------------------------------------------------------- 抓取
+def inst_fut(date):
+    html = post("/cht/3/futContractsDate",
+                {"queryType": "2", "goDay": "", "doQuery": "1",
+                 "dateaddcnt": "", "queryDate": date, "commodityId": ""})
+    df = max(tables(html), key=len)
+    df.iloc[:, 1] = df.iloc[:, 1].ffill()
+    out = {}
+    for code, name in PROD.items():
+        out[code] = {}
+        for w in WHO:
+            r = rowfind(df, name, w)
+            if r is None:
                 continue
-            for _, row in df.iterrows():
-                if "所有契約" in str(row.get(c_m, "")):
-                    v = _num(row[c_oi])
-                    if v and v > 0:
-                        return v, "largeTrader"
-    except Exception:
-        pass
+            out[code][w] = {"買賣超": num(r.iloc[7]), "多單": num(r.iloc[9]),
+                            "空單": num(r.iloc[11]), "淨未平倉": num(r.iloc[13])}
+    return out
 
-    # 策略 B：期貨每日交易行情（一般交易時段，marketCode=0）
-    for v in ({"queryType": "2", "marketCode": "0", "MarketCode": "0",
-               "dateaddcnt": "0", "commodity_id": commodity, "commodity_id2": "",
-               "commodity_idt": commodity, "queryDate": date_str, "doQuery": "1"},
-              {"queryType": "2", "marketCode": "0", "commodity_id": commodity,
-               "queryDate": date_str}):
-        try:
-            html = _post_html("/cht/3/futDailyMarketReport", v, retry=2)
-            if date_str not in html:
-                continue
-            for df in _read_named(html):
-                c_oi = _col(df, "未沖銷")
-                c_c = _col(df, "契約")
-                c_m = _col(df, "到期月份")
-                if not (c_oi and c_c and c_m):
-                    continue
-                if "價差" in str(c_oi):          # 跳過價差行情表
-                    continue
-                tot = 0
-                for _, row in df.iterrows():
-                    if str(row[c_c]).strip() != commodity:
-                        continue
-                    if "/" in str(row[c_m]):     # 排除價差契約
-                        continue
-                    n = _num(row[c_oi])
-                    if n:
-                        tot += n
-                if tot > 0:
-                    return tot, "marketReport"
-        except Exception:
+
+def inst_opt(date):
+    html = post("/cht/3/callsAndPutsDate",
+                {"queryType": "2", "goDay": "", "doQuery": "1",
+                 "dateaddcnt": "", "queryDate": date, "commodityId": "TXO"})
+    df = max(tables(html), key=len)
+    out = {}
+    for cp, kw in (("CALL", "買權"), ("PUT", "賣權")):
+        out[cp] = {}
+        for w in WHO:
+            r = rowfind(df, kw, w)
+            if r is not None:
+                out[cp][w] = {"買賣超": num(r.iloc[8]), "淨未平倉": num(r.iloc[14])}
+    return out
+
+
+def large_trader(date, code="TX"):
+    """回傳 (十大交易人淨, 十大特定法人淨, 全市場OI)"""
+    html = post("/cht/3/largeTraderFutQry",
+                {"queryType": "1", "goDay": "", "doQuery": "1", "dateaddcnt": "",
+                 "queryDate": date, "commodityId": code, "contractId": code})
+    for df in tables(html):
+        c_oi = col(df, "全市場未沖銷")
+        c_b = col(df, "買方", "前十")
+        c_s = col(df, "賣方", "前十")
+        if not c_oi:
             continue
+        res = {"十大交易人": None, "十大特定法人": None, "全市場OI": None}
+        for _, r in df.iterrows():
+            j = " ".join(str(v) for v in r.tolist())
+            if "所有契約" not in j:
+                continue
+            oi = num(r[c_oi])
+            if oi:
+                res["全市場OI"] = oi
+            if c_b and c_s:
+                b, s = num(r[c_b]), num(r[c_s])
+                if b is not None and s is not None:
+                    key = "十大特定法人" if "特定法人" in j else "十大交易人"
+                    res[key] = b - s
+        if res["全市場OI"]:
+            return res
+    return {"十大交易人": None, "十大特定法人": None, "全市場OI": None}
 
-    # 策略 C：每日下載 ZIP
+
+def pc_ratio(date):
     try:
-        y, m, d = date_str.split("/")
-        r = SESSION.get(f"{BASE}/file/taifex/Dailydownload/DailydownloadCSV/"
-                        f"Daily_{y}_{m}_{d}.zip", timeout=45)
-        if r.status_code == 200 and r.content[:2] == b"PK":
-            zf = zipfile.ZipFile(io.BytesIO(r.content))
-            raw = zf.read(zf.namelist()[0])
-            df = None
-            for enc in ("big5", "cp950", "utf-8"):
-                try:
-                    df = pd.read_csv(io.BytesIO(raw), encoding=enc,
-                                     on_bad_lines="skip")
-                    break
-                except Exception:
-                    pass
-            if df is not None:
-                df.columns = [str(c).strip() for c in df.columns]
-                cc = next((c for c in df.columns if c.startswith("契約")), None)
-                cm = next((c for c in df.columns if "到期月份" in c), None)
-                co = next((c for c in df.columns if "未沖銷" in c), None)
-                if cc and cm and co:
-                    s = df[df[cc].astype(str).str.strip() == commodity]
-                    s = s[~s[cm].astype(str).str.contains("/")]
-                    for c in df.columns:
-                        if "交易時段" in c:
-                            s = s[s[c].astype(str).str.contains("一般")]
-                            break
-                    tot = pd.to_numeric(s[co], errors="coerce").sum()
-                    if tot > 0:
-                        return int(tot), "zip"
+        df = max(tables(post("/cht/3/pcRatio",
+                 {"queryStartDate": date, "queryEndDate": date})), key=len)
+        r = df.iloc[-1]
+        return {"未平倉比": str(r.iloc[6]), "成交量比": str(r.iloc[3])}
     except Exception:
-        pass
-    return None, None
-
-
-def retail(inst_fut, prod, total_oi):
-    """散戶多單=全市場OI-三大法人多單；散戶空單=全市場OI-三大法人空單"""
-    if not total_oi:
         return None
-    legs = [inst_fut[prod][w] for w in ("自營商", "投信", "外資")]
-    if any(x is None for x in legs):
-        return None
-    il = sum(x["多方未平倉"] or 0 for x in legs)
-    isr = sum(x["空方未平倉"] or 0 for x in legs)
-    rl, rs = total_oi - il, total_oi - isr
-    return {"全市場OI": total_oi, "散戶多單": rl, "散戶空單": rs,
-            "散戶淨": rl - rs, "多空比": round((rl - rs) / total_oi * 100, 2)}
 
 
-# ------------------------------------------------- 現貨三大法人
-def fetch_twse_inst(date_str):
-    d = date_str.replace("/", "")
+def spot(date):
     try:
-        js = SESSION.get(f"https://www.twse.com.tw/rwd/zh/fund/BFI82U"
-                         f"?dayDate={d}&type=day&response=json", timeout=20).json()
+        js = S.get("https://www.twse.com.tw/rwd/zh/fund/BFI82U"
+                   f"?dayDate={date.replace('/','')}&type=day&response=json",
+                   timeout=20).json()
         if js.get("stat") != "OK":
-            return None
-        out = {}
+            return {}
+        o = {}
         for r in js["data"]:
-            name = r[0].strip()
-            v = _num(r[3])
+            n, v = r[0].strip(), num(r[3])
             if v is None:
                 continue
-            if "外" in name:
-                out["外資"] = out.get("外資", 0) + v
-            elif "投信" in name:
-                out["投信"] = v
-            elif "自營" in name:
-                out["自營商"] = out.get("自營商", 0) + v
-            elif "合計" in name:
-                out["合計"] = v
-        return out
+            k = "外資" if "外" in n else "投信" if "投信" in n else \
+                "自營商" if "自營" in n else None
+            if k:
+                o[k] = o.get(k, 0) + v
+        return o
     except Exception:
+        return {}
+
+
+def retail(fut, code, oi):
+    legs = [fut[code].get(w) for w in WHO]
+    if not oi or any(x is None for x in legs):
         return None
+    il = sum(x["多單"] or 0 for x in legs)
+    isr = sum(x["空單"] or 0 for x in legs)
+    rl, rs = oi - il, oi - isr
+    return {"多單": rl, "空單": rs, "淨": rl - rs,
+            "多空比": round((rl - rs) / oi * 100, 2), "OI": oi}
 
 
-# ------------------------------------------------- P/C Ratio
-def fetch_pc_ratio(date_str):
+# ---------------------------------------------------------------- 組裝
+def build(date):
+    rep = {"日期": date, "期貨": inst_fut(date)}
     try:
-        html = _post_html("/cht/3/pcRatio",
-                          {"queryStartDate": date_str, "queryEndDate": date_str})
-        tbs = _tables(html, min_rows=1)
-        if not tbs:
-            return None
-        row = max(tbs, key=len).iloc[-1]
-        return {"未平倉PC比": str(row.get(6)), "成交量PC比": str(row.get(3))}
-    except Exception:
-        return None
-
-
-# ------------------------------------------------- 組報表
-def build_report(date_str):
-    rep = {"日期": date_str}
-
-    fut, fut_df = fetch_inst_futures(date_str)
-    rep["期貨"] = fut
-    _dump(fut_df, "fut", date_str)
-
-    try:
-        opt, opt_df = fetch_inst_options(date_str)
-        rep["選擇權"] = opt
-        _dump(opt_df, "opt", date_str)
+        rep["選擇權"] = inst_opt(date)
     except Exception as e:
         rep["選擇權"] = {"error": str(e)}
 
-    # 前一交易日（算部位增減）
-    rep["前日"] = None
+    rep["大額"] = {c: large_trader(date, c) for c in ("TX", "MTX", "TMF")}
+    rep["散戶"] = {c: retail(rep["期貨"], c, rep["大額"][c]["全市場OI"])
+                   for c in ("MTX", "TMF")}
+    rep["現貨"] = spot(date)
+    rep["PC"] = pc_ratio(date)
+
+    p = prev_day(date)
     try:
-        p = prev_trading_day(date_str)
-        pf, _ = fetch_inst_futures(p)
-        po = None
-        try:
-            po, _ = fetch_inst_options(p)
-        except Exception:
-            pass
-        rep["前日"] = {"日期": p, "期貨": pf, "選擇權": po,
-                       "現貨": fetch_twse_inst(p)}
+        rep["前日"] = {"日期": p, "期貨": inst_fut(p),
+                       "選擇權": inst_opt(p), "現貨": spot(p)}
     except Exception:
-        pass
-
-    # 散戶多空比（小台、微台）
-    rep["散戶"] = {}
-    for prod in ("MTX", "TMF"):
-        oi, src = fetch_total_oi(date_str, prod)
-        r = retail(fut, prod, oi)
-        if r:
-            r["來源"] = src
-        rep["散戶"][prod] = r
-
-    rep["現貨"] = fetch_twse_inst(date_str)
-    rep["PCRatio"] = fetch_pc_ratio(date_str)
+        rep["前日"] = None
     return rep
 
 
-def chg(rep, kind, prod, who, field):
-    """今日 vs 前日 差額"""
+def diff(rep, kind, key, who):
     try:
-        a = rep[kind][prod][who][field]
-        b = rep["前日"][kind][prod][who][field]
-        return a - b
+        return rep[kind][key][who]["淨未平倉"] - rep["前日"][kind][key][who]["淨未平倉"]
     except Exception:
         return None
 
 
-# ------------------------------------------------- 終端機輸出
-def print_report(rep):
+# ---------------------------------------------------------------- 輸出
+def render(rep):
+    d = rep["日期"]
     f = lambda v: "—" if v is None else f"{v:+,}"
-    print("\n" + "═" * 54)
-    print(f"  台指期籌碼快訊　{rep['日期']}")
-    print("═" * 54)
 
-    print("\n★ 散戶多空比")
-    for prod, lbl in (("MTX", "小台"), ("TMF", "微台")):
-        r = rep["散戶"].get(prod)
-        if r:
-            print(f"  {lbl}  {r['多空比']:+.2f}%   "
-                  f"多單 {r['散戶多單']:,} / 空單 {r['散戶空單']:,}"
-                  f"   (全市場OI {r['全市場OI']:,})")
-        else:
-            print(f"  {lbl}  — 全市場未平倉量取得失敗")
-
-    print("\n★ 三大法人籌碼變化　(括號為前日增減)")
-    print(f"  {'':<6}{'現貨(億)':>12}{'台指(口)':>16}{'Call(口)':>16}{'Put(口)':>16}")
-    for who in ("外資", "投信", "自營商"):
-        sp = (rep.get("現貨") or {}).get(who)
-        spp = ((rep.get("前日") or {}).get("現貨") or {}).get(who)
-        sp_s = f"{sp/1e8:+,.2f}" if sp is not None else "—"
-        tx = rep["期貨"]["TX"].get(who) or {}
-        cells = [f"{sp_s:>12}"]
-        for kind, prod, key in (("期貨", "TX", None), ("選擇權", "CALL", None),
-                                ("選擇權", "PUT", None)):
-            src = rep.get(kind)
-            v = None
-            if isinstance(src, dict) and "error" not in src:
-                v = (src.get(prod) or {}).get(who, {}).get("淨未平倉")
-            d = chg(rep, kind, prod, who, "淨未平倉")
-            cells.append(f"{('—' if v is None else format(v, ',')):>9}"
-                         f"({'—' if d is None else format(d, '+,')})".rjust(16))
-        print(f"  {who:<6}" + "".join(cells))
-
-    print("\n★ 外資買賣超（當日交易口數淨額）")
-    for prod, lbl in (("TX", "台指期"), ("MTX", "小台"), ("TMF", "微台")):
-        v = (rep["期貨"][prod].get("外資") or {}).get("買賣超口數")
-        print(f"  {lbl:<6} {f(v):>10} 口")
-    sp = (rep.get("現貨") or {}).get("外資")
-    if sp is not None:
-        print(f"  {'現貨':<6} {sp/1e8:>+10,.2f} 億元")
-
-    if rep.get("PCRatio"):
-        print(f"\n  P/C Ratio 未平倉比 {rep['PCRatio']['未平倉PC比']}")
+    print(f"\n=== 台指期籌碼快訊 {d} ===\n")
+    for c, lbl in (("MTX", "小台"), ("TMF", "微台")):
+        r = rep["散戶"].get(c)
+        print(f"{lbl}散戶多空比 " + (f"{r['多空比']:+.2f}%  多單 {r['多單']:,} "
+              f"空單 {r['空單']:,}  OI {r['OI']:,}" if r
+              else f"取得失敗 (OI={rep['大額'][c]['全市場OI']})"))
     print()
+    for w in WHO:
+        tx = rep["期貨"]["TX"].get(w, {})
+        sp = rep["現貨"].get(w)
+        print(f"{w:<4} 台指 {f(tx.get('淨未平倉'))}({f(diff(rep,'期貨','TX',w))})"
+              f"  現貨 " + (f"{sp/1e8:+,.2f}億" if sp is not None else "—"))
+    if rep.get("PC"):
+        print(f"\nP/C 未平倉比 {rep['PC']['未平倉比']}  成交量比 {rep['PC']['成交量比']}")
+    lt = rep["大額"]["TX"]
+    print(f"十大交易人 {f(lt['十大交易人'])}  十大特定法人 {f(lt['十大特定法人'])}")
 
-
-# ------------------------------------------------- HTML 輸出
-def write_html(rep, path):
-    def sp(v):
+    # ---- HTML ----
+    def sp_(v, u=""):
         if v is None:
-            return "<span class=na>—</span>"
-        c = "up" if v > 0 else ("dn" if v < 0 else "")
-        return f"<span class={c}>{v:+,}</span>"
+            return "<span class=g>—</span>"
+        c = "u" if v > 0 else "n"
+        return f"<span class={c}>{v:+,}{u}</span>"
 
-    def small(v):
-        if v is None:
-            return ""
-        c = "up" if v > 0 else ("dn" if v < 0 else "")
-        return f"<span class='s {c}'>({v:+,})</span>"
+    def sm(v):
+        return "" if v is None else \
+            f"<span class='s {'u' if v>0 else 'n'}'>({v:+,})</span>"
 
-    H = []
-
-    # 散戶多空比（頭條）
-    H.append("<h2>散戶多空比</h2><div class=cards>")
-    for prod, lbl in (("MTX", "小台"), ("TMF", "微台")):
-        r = rep["散戶"].get(prod)
+    H = ["<h2>散戶多空比</h2><div class=c>"]
+    for c, lbl in (("MTX", "小台"), ("TMF", "微台")):
+        r = rep["散戶"].get(c)
         if r:
-            c = "up" if r["多空比"] > 0 else "dn"
-            H.append(f"<div class=card><div class=lbl>{lbl}</div>"
-                     f"<div class='big {c}'>{r['多空比']:+.2f}%</div>"
-                     f"<div class=sub>多單 {r['散戶多單']:,}　空單 {r['散戶空單']:,}<br>"
-                     f"全市場OI {r['全市場OI']:,}</div></div>")
+            H.append(f"<div class=k><div>{lbl}</div>"
+                     f"<b class={'u' if r['多空比']>0 else 'n'}>{r['多空比']:+.2f}%</b>"
+                     f"<div class=s>多單 {r['多單']:,}　空單 {r['空單']:,}<br>"
+                     f"全市場OI {r['OI']:,}</div></div>")
         else:
-            H.append(f"<div class=card><div class=lbl>{lbl}</div>"
-                     f"<div class='big na'>—</div>"
-                     f"<div class=sub>全市場未平倉量取得失敗</div></div>")
+            H.append(f"<div class=k><div>{lbl}</div><b class=g>—</b></div>")
     H.append("</div>")
 
-    # 三大法人籌碼變化
-    H.append("<h2>三大法人籌碼變化　<span class=s>口 / 億元，括號為前日增減</span></h2>")
-    H.append("<table class=grid><tr><th></th><th>現貨(億)</th><th>台指(口)</th>"
+    H.append("<h2>三大法人籌碼變化 <span class=s>括號為前日增減</span></h2>"
+             "<table class=grid><tr><th></th><th>現貨(億)</th><th>台指(口)</th>"
              "<th>Call(口)</th><th>Put(口)</th></tr>")
-    for who in ("外資", "投信", "自營商"):
-        tds = [f"<th class=who>{who}</th>"]
-        v = (rep.get("現貨") or {}).get(who)
-        pv = ((rep.get("前日") or {}).get("現貨") or {}).get(who)
+    for w in WHO:
+        td = [f"<th>{w}</th>"]
+        v = rep["現貨"].get(w)
+        pv = ((rep.get("前日") or {}).get("現貨") or {}).get(w)
         if v is None:
-            tds.append("<td class=na>—</td>")
+            td.append("<td class=g>—</td>")
         else:
-            c = "up" if v > 0 else "dn"
-            d = "" if pv is None else (f"<span class='s {'up' if v-pv>0 else 'dn'}'>"
-                                       f"({(v-pv)/1e8:+,.2f})</span>")
-            tds.append(f"<td><span class={c}>{v/1e8:+,.2f}</span><br>{d}</td>")
-        for kind, prod in (("期貨", "TX"), ("選擇權", "CALL"), ("選擇權", "PUT")):
+            dd = "" if pv is None else \
+                f"<span class='s {'u' if v-pv>0 else 'n'}'>({(v-pv)/1e8:+,.2f})</span>"
+            td.append(f"<td><span class={'u' if v>0 else 'n'}>"
+                      f"{v/1e8:+,.2f}</span><br>{dd}</td>")
+        for kind, key in (("期貨", "TX"), ("選擇權", "CALL"), ("選擇權", "PUT")):
             src = rep.get(kind)
-            val = None
-            if isinstance(src, dict) and "error" not in src:
-                val = (src.get(prod) or {}).get(who, {}).get("淨未平倉")
-            d = chg(rep, kind, prod, who, "淨未平倉")
-            tds.append(f"<td>{sp(val)}<br>{small(d)}</td>")
-        H.append("<tr>" + "".join(tds) + "</tr>")
+            val = (src.get(key) or {}).get(w, {}).get("淨未平倉") \
+                if isinstance(src, dict) and "error" not in src else None
+            td.append(f"<td>{sp_(val)}<br>{sm(diff(rep, kind, key, w))}</td>")
+        H.append("<tr>" + "".join(td) + "</tr>")
     H.append("</table>")
 
-    # 外資買賣超
     H.append("<h2>外資買賣超（當日交易淨額）</h2><table>")
-    for prod, lbl in (("TX", "台指期"), ("MTX", "小台"), ("TMF", "微台"),
-                      ("TE", "電子期"), ("TF", "金融期")):
-        v = (rep["期貨"][prod].get("外資") or {}).get("買賣超口數")
-        H.append(f"<tr><td>{lbl}</td><td class=r>{sp(v)} 口</td></tr>")
-    v = (rep.get("現貨") or {}).get("外資")
+    for c, lbl in (("TX", "台指期"), ("MTX", "小台"), ("TMF", "微台"),
+                   ("TE", "電子期"), ("TF", "金融期")):
+        H.append(f"<tr><td>{lbl}</td><td class=r>"
+                 f"{sp_((rep['期貨'][c].get('外資') or {}).get('買賣超'))} 口</td></tr>")
+    v = rep["現貨"].get("外資")
     if v is not None:
-        c = "up" if v > 0 else "dn"
-        H.append(f"<tr><td>現貨</td><td class=r>"
-                 f"<span class={c}>{v/1e8:+,.2f}</span> 億</td></tr>")
+        H.append(f"<tr><td>現貨</td><td class=r><span class={'u' if v>0 else 'n'}>"
+                 f"{v/1e8:+,.2f}</span> 億</td></tr>")
     H.append("</table>")
 
-    if rep.get("PCRatio"):
+    H.append("<h2>大額交易人 TX</h2><table>"
+             f"<tr><td>十大交易人淨部位</td><td class=r>{sp_(lt['十大交易人'])}</td></tr>"
+             f"<tr><td>十大特定法人淨部位</td><td class=r>"
+             f"{sp_(lt['十大特定法人'])}</td></tr></table>")
+
+    if rep.get("PC"):
         H.append("<h2>Put / Call Ratio</h2><table>"
-                 f"<tr><td>未平倉量比</td><td class=r>{rep['PCRatio']['未平倉PC比']}</td></tr>"
-                 f"<tr><td>成交量比</td><td class=r>{rep['PCRatio']['成交量PC比']}</td></tr>"
+                 f"<tr><td>未平倉量比</td><td class=r>{rep['PC']['未平倉比']}</td></tr>"
+                 f"<tr><td>成交量比</td><td class=r>{rep['PC']['成交量比']}</td></tr>"
                  "</table>")
 
-    html = f"""<!doctype html><html lang=zh-Hant><meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1">
-<title>台指期籌碼快訊 {rep['日期']}</title>
-<style>
-:root{{--up:#d32f2f;--dn:#2e7d32}}
-*{{box-sizing:border-box}}
-body{{font-family:-apple-system,"Noto Sans TC","PingFang TC",sans-serif;margin:0;
-padding:16px;max-width:700px;color:#1a1a1a;background:#fff}}
-h1{{font-size:19px;margin:0;border-bottom:3px solid #c62828;padding-bottom:8px}}
-.date{{color:#777;font-size:12px;margin:8px 0 20px}}
-h2{{font-size:14px;margin:24px 0 8px;color:#c62828}}
-.s{{font-size:11px;font-weight:400;color:#888}}
-.cards{{display:flex;gap:10px}}
-.card{{flex:1;border:1px solid #e8e8e8;border-radius:10px;padding:12px;text-align:center}}
-.card .lbl{{font-size:12px;color:#777}}
-.card .big{{font-size:26px;font-weight:700;margin:4px 0;
-font-variant-numeric:tabular-nums}}
-.card .sub{{font-size:11px;color:#888;line-height:1.5}}
-table{{border-collapse:collapse;width:100%;font-size:14px}}
-td,th{{border-bottom:1px solid #eee;padding:9px 5px;text-align:center}}
-table.grid th{{background:#f5f5f5;font-size:12px;color:#555}}
-th.who{{background:#fafafa;width:56px}}
-td:first-child{{text-align:left}}
-.r{{text-align:right;font-weight:600;font-variant-numeric:tabular-nums}}
-.up{{color:var(--up)}} .dn{{color:var(--dn)}} .na{{color:#bbb}}
-footer{{margin-top:26px;color:#999;font-size:11px;line-height:1.6}}
-</style>
-<h1>台指期籌碼快訊</h1>
-<div class=date>資料日期 {rep['日期']}　·　更新 {dt.datetime.now():%m-%d %H:%M}</div>
-{''.join(H)}
-<footer>散戶多單=全市場OI−三大法人多單；散戶空單=全市場OI−三大法人空單；
-多空比=(多單−空單)/全市場OI×100%。<br>
-資料來源：臺灣期貨交易所、臺灣證券交易所。僅供參考，不構成投資建議。</footer></html>"""
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(html)
+    css = ("body{font-family:-apple-system,'Noto Sans TC',sans-serif;padding:16px;"
+           "max-width:680px;margin:0}h1{font-size:19px;margin:0;border-bottom:3px "
+           "solid #c62828;padding-bottom:8px}.d{color:#888;font-size:12px;"
+           "margin:8px 0 18px}h2{font-size:14px;color:#c62828;margin:24px 0 8px}"
+           ".s{font-size:11px;font-weight:400;color:#888}.c{display:flex;gap:10px}"
+           ".k{flex:1;border:1px solid #e5e5e5;border-radius:10px;padding:12px;"
+           "text-align:center;font-size:12px;color:#777}.k b{display:block;"
+           "font-size:26px;margin:4px 0;font-variant-numeric:tabular-nums}"
+           "table{border-collapse:collapse;width:100%;font-size:14px}"
+           "td,th{border-bottom:1px solid #eee;padding:9px 5px;text-align:center}"
+           "table.grid th{background:#f5f5f5;font-size:12px;color:#555}"
+           "td:first-child{text-align:left}.r{text-align:right;font-weight:600}"
+           ".u{color:#d32f2f}.n{color:#2e7d32}.g{color:#bbb}"
+           "footer{margin-top:26px;color:#999;font-size:11px;line-height:1.6}")
 
-
-# ------------------------------------------------- main
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("-d", "--date")
-    ap.add_argument("--watch", action="store_true")
-    ap.add_argument("--html", action="store_true")
-    a = ap.parse_args()
-
-    date_str = a.date or last_trading_day().strftime("%Y/%m/%d")
-
-    if a.watch:
-        t = dt.datetime.combine(dt.date.today(), dt.time(15, 0))
-        if dt.datetime.now() < t:
-            w = (t - dt.datetime.now()).total_seconds()
-            print(f"等待至 15:00（{w/60:.0f} 分鐘）…")
-            time.sleep(w)
-        for _ in range(30):
-            try:
-                rep = build_report(date_str)
-                break
-            except Exception as e:
-                print(f"[{dt.datetime.now():%H:%M:%S}] 尚未公布：{e}")
-                time.sleep(60)
-        else:
-            sys.exit("逾時")
-    else:
-        rep = build_report(date_str)
-
-    print_report(rep)
-    tag = date_str.replace("/", "")
-    with open(os.path.join(OUTDIR, f"chips_{tag}.json"), "w", encoding="utf-8") as f:
-        json.dump(rep, f, ensure_ascii=False, indent=2, default=str)
-    if a.html:
-        write_html(rep, os.path.join(OUTDIR, f"chips_{tag}.html"))
-        print("→ HTML 已產生")
+    os.makedirs(os.path.join(OUT, "docs"), exist_ok=True)
+    with open(os.path.join(OUT, "docs", "index.html"), "w", encoding="utf-8") as fh:
+        fh.write(f"<!doctype html><html lang=zh-Hant><meta charset=utf-8>"
+                 f"<meta name=viewport content='width=device-width,initial-scale=1'>"
+                 f"<title>籌碼快訊 {d}</title><style>{css}</style>"
+                 f"<h1>台指期籌碼快訊</h1><div class=d>資料日期 {d}　·　更新 "
+                 f"{dt.datetime.now():%m-%d %H:%M}</div>{''.join(H)}"
+                 f"<footer>散戶多單=全市場OI−三大法人多單；空單同理；"
+                 f"多空比=(多單−空單)/OI×100%。<br>資料來源：臺灣期貨交易所、"
+                 f"臺灣證券交易所。僅供參考，不構成投資建議。</footer></html>")
+    with open(os.path.join(OUT, f"chips_{d.replace('/','')}.json"), "w",
+              encoding="utf-8") as fh:
+        json.dump(rep, fh, ensure_ascii=False, indent=2, default=str)
+    print("\n→ docs/index.html 已產生")
 
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-d", "--date")
+    a = ap.parse_args()
+    d = dt.date.today()
+    while d.weekday() >= 5:
+        d -= dt.timedelta(days=1)
+    render(build(a.date or d.strftime("%Y/%m/%d")))

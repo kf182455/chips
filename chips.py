@@ -114,6 +114,36 @@ def prev_trading_day(s):
     return d.strftime("%Y/%m/%d")
 
 
+
+def _read_named(html):
+    """讀表格並把多層表頭攤平成可辨識的欄位名稱（避免依賴欄位位置）。"""
+    out = []
+    for df in pd.read_html(io.StringIO(html)):
+        cols = []
+        for c in df.columns:
+            if isinstance(c, tuple):
+                seen = []
+                for x in c:
+                    x = str(x).strip()
+                    if x.startswith("Unnamed") or x in seen:
+                        continue
+                    seen.append(x)
+                cols.append(" ".join(seen))
+            else:
+                cols.append(str(c).strip())
+        d = df.copy()
+        d.columns = cols
+        out.append(d)
+    return out
+
+
+def _col(df, *kw):
+    for c in df.columns:
+        if all(k in str(c) for k in kw):
+            return c
+    return None
+
+
 # ------------------------------------------------- 三大法人 期貨
 def fetch_inst_futures(date_str):
     html = _post_html("/cht/3/futContractsDate", {
@@ -162,25 +192,78 @@ def fetch_inst_options(date_str):
 # ------------------------------------------------- 全市場未平倉量
 def fetch_total_oi(date_str, commodity):
     """
-    行情表欄位: 0契約 1到期月份 2開 3高 4低 5收 6漲跌 7漲跌% 8成交量
-                9結算價 10未沖銷契約量 ...
-    必須指定「一般交易時段」(marketCode=0)，盤後時段該欄全為 '-'。
+    取得該商品全市場未沖銷契約量(OI)。
+    一律用「欄位名稱」定位，不依賴欄位位置
+    （期交所 2025/12/08 起一般交易時段行情表新增「契約到期日」欄，位置會位移）。
     """
-    # 策略 A：每日下載 ZIP（最穩定，無表單參數問題）
-    y, m, d = date_str.split("/")
+    # 策略 A：大額交易人表的「全市場未沖銷部位數」— 定義上就是全市場 OI
     try:
+        html = _post_html("/cht/3/largeTraderFutQry", {
+            "queryType": "1", "goDay": "", "doQuery": "1", "dateaddcnt": "",
+            "queryDate": date_str, "commodityId": commodity,
+            "contractId": commodity,
+        }, retry=2)
+        for df in _read_named(html):
+            c_oi = _col(df, "全市場未沖銷")
+            c_m = _col(df, "到期月份") or _col(df, "契約")
+            if not c_oi:
+                continue
+            for _, row in df.iterrows():
+                if "所有契約" in str(row.get(c_m, "")):
+                    v = _num(row[c_oi])
+                    if v and v > 0:
+                        return v, "largeTrader"
+    except Exception:
+        pass
+
+    # 策略 B：期貨每日交易行情（一般交易時段，marketCode=0）
+    for v in ({"queryType": "2", "marketCode": "0", "MarketCode": "0",
+               "dateaddcnt": "0", "commodity_id": commodity, "commodity_id2": "",
+               "commodity_idt": commodity, "queryDate": date_str, "doQuery": "1"},
+              {"queryType": "2", "marketCode": "0", "commodity_id": commodity,
+               "queryDate": date_str}):
+        try:
+            html = _post_html("/cht/3/futDailyMarketReport", v, retry=2)
+            if date_str not in html:
+                continue
+            for df in _read_named(html):
+                c_oi = _col(df, "未沖銷")
+                c_c = _col(df, "契約")
+                c_m = _col(df, "到期月份")
+                if not (c_oi and c_c and c_m):
+                    continue
+                if "價差" in str(c_oi):          # 跳過價差行情表
+                    continue
+                tot = 0
+                for _, row in df.iterrows():
+                    if str(row[c_c]).strip() != commodity:
+                        continue
+                    if "/" in str(row[c_m]):     # 排除價差契約
+                        continue
+                    n = _num(row[c_oi])
+                    if n:
+                        tot += n
+                if tot > 0:
+                    return tot, "marketReport"
+        except Exception:
+            continue
+
+    # 策略 C：每日下載 ZIP
+    try:
+        y, m, d = date_str.split("/")
         r = SESSION.get(f"{BASE}/file/taifex/Dailydownload/DailydownloadCSV/"
                         f"Daily_{y}_{m}_{d}.zip", timeout=45)
         if r.status_code == 200 and r.content[:2] == b"PK":
             zf = zipfile.ZipFile(io.BytesIO(r.content))
             raw = zf.read(zf.namelist()[0])
+            df = None
             for enc in ("big5", "cp950", "utf-8"):
                 try:
                     df = pd.read_csv(io.BytesIO(raw), encoding=enc,
                                      on_bad_lines="skip")
                     break
                 except Exception:
-                    df = None
+                    pass
             if df is not None:
                 df.columns = [str(c).strip() for c in df.columns]
                 cc = next((c for c in df.columns if c.startswith("契約")), None)
@@ -198,34 +281,6 @@ def fetch_total_oi(date_str, commodity):
                         return int(tot), "zip"
     except Exception:
         pass
-
-    # 策略 B：每日交易行情查詢頁（一般交易時段）
-    variants = [
-        {"queryType": "2", "marketCode": "0", "MarketCode": "0", "dateaddcnt": "0",
-         "commodity_id": commodity, "commodity_id2": "", "commodity_idt": commodity,
-         "queryDate": date_str, "doQuery": "1"},
-        {"queryType": "2", "marketCode": "0", "commodity_id": commodity,
-         "queryDate": date_str},
-    ]
-    for v in variants:
-        try:
-            html = _post_html("/cht/3/futDailyMarketReport", v, retry=2)
-            if date_str not in html:
-                continue
-            for df in _tables(html, min_rows=1):
-                if str(df.iloc[0, 0]).strip() != commodity:
-                    continue
-                tot = 0
-                for _, row in df.iterrows():
-                    if "/" in str(row.get(1)):        # 排除價差
-                        continue
-                    n = _num(row.get(10))
-                    if n:
-                        tot += n
-                if tot > 0:
-                    return tot, "report"
-        except Exception:
-            continue
     return None, None
 
 
